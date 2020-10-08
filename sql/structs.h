@@ -880,7 +880,12 @@ public:
       integer precision.
     */
     DBUG_ASSERT(usec < 1000000);
+/* apple timeval tv_usec is __darwin_suseconds_t aka int */
+#ifdef __APPLE__
+    tv_usec= static_cast<int>(usec);
+#else
     tv_usec= (uint)usec;
+#endif
   }
   explicit Timeval(const timeval &tv)
    :timeval(tv)
