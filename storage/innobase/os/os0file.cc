@@ -4479,8 +4479,9 @@ void fil_node_t::find_metadata(os_file_t file
 }
 
 /** Read the first page of a data file.
+@param validate	validate the page0
 @return	whether the page was found valid */
-bool fil_node_t::read_page0()
+bool fil_node_t::read_page0(bool validate)
 {
 	mysql_mutex_assert_owner(&fil_system.mutex);
 	const unsigned psize = space->physical_size();
@@ -4503,6 +4504,10 @@ bool fil_node_t::read_page0()
 		return false;
 	}
 
+	if (!validate)
+	  goto skip_page0;
+
+	{
 	page_t *page= static_cast<byte*>(aligned_malloc(psize, psize));
 	if (os_file_read(IORequestRead, handle, page, 0, psize)
 	    != DB_SUCCESS) {
@@ -4561,6 +4566,14 @@ invalid:
 		return false;
 	}
 
+	space->flags = (space->flags & FSP_FLAGS_MEM_MASK) | flags;
+	ut_ad(space->free_limit == 0 || space->free_limit == free_limit);
+	ut_ad(space->free_len == 0 || space->free_len == free_len);
+	space->size_in_header = size;
+	space->free_limit = free_limit;
+	space->free_len = free_len;
+	}
+skip_page0:
 #ifdef UNIV_LINUX
 	find_metadata(handle, &statbuf);
 #else
@@ -4576,16 +4589,9 @@ invalid:
 		size_bytes &= ~os_offset_t(mask);
 	}
 
-	space->flags = (space->flags & FSP_FLAGS_MEM_MASK) | flags;
-
 	space->punch_hole = space->is_compressed();
 	this->size = uint32_t(size_bytes / psize);
 	space->set_sizes(this->size);
-	ut_ad(space->free_limit == 0 || space->free_limit == free_limit);
-	ut_ad(space->free_len == 0 || space->free_len == free_len);
-	space->size_in_header = size;
-	space->free_limit = free_limit;
-	space->free_len = free_len;
 	return true;
 }
 #endif /* !UNIV_INNOCHECKSUM */

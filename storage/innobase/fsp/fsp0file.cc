@@ -405,6 +405,7 @@ Datafile::validate_for_recovery()
 	switch (err) {
 	case DB_SUCCESS:
 	case DB_TABLESPACE_EXISTS:
+	case DB_DEFER_TABLESPACE:
 		break;
 
 	default:
@@ -486,6 +487,11 @@ err_exit:
 		}
 
 		if (nonzero_bytes == 0) {
+			if (recv_recovery_is_on()) {
+				free_first_page();
+				return DB_DEFER_TABLESPACE;
+			}
+
 			error_txt = "Header page consists of zero bytes";
 			goto err_exit;
 		}

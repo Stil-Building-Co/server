@@ -343,8 +343,9 @@ fil_node_t* fil_space_t::add(const char* name, pfs_os_file_t handle,
 
 /** Open a tablespace file.
 @param node  data file
+@param validate validate the page0
 @return whether the file was successfully opened */
-static bool fil_node_open_file_low(fil_node_t *node)
+static bool fil_node_open_file_low(fil_node_t *node, bool validate=true)
 {
   ut_ad(!node->is_open());
   ut_ad(node->space->is_closing());
@@ -382,7 +383,7 @@ static bool fil_node_open_file_low(fil_node_t *node)
   }
 
   if (node->size);
-  else if (!node->read_page0() || !fil_comp_algo_validate(node->space))
+  else if (!node->read_page0(validate) || !fil_comp_algo_validate(node->space))
   {
     os_file_close(node->handle);
     node->handle= OS_FILE_CLOSED;
@@ -405,8 +406,9 @@ static bool fil_node_open_file_low(fil_node_t *node)
 
 /** Open a tablespace file.
 @param node  data file
+@param validate_page0 validate the page0
 @return whether the file was successfully opened */
-static bool fil_node_open_file(fil_node_t *node)
+bool fil_node_open_file(fil_node_t *node, bool validate_page0)
 {
   mysql_mutex_assert_owner(&fil_system.mutex);
   ut_ad(!node->is_open());
@@ -438,7 +440,7 @@ static bool fil_node_open_file(fil_node_t *node)
     }
   }
 
-  return fil_node_open_file_low(node);
+  return fil_node_open_file_low(node, validate_page0);
 }
 
 /** Close the file handle. */
@@ -637,7 +639,7 @@ fil_space_extend_must_retry(
 }
 
 /** @return whether the file is usable for io() */
-ATTRIBUTE_COLD bool fil_space_t::prepare(bool have_mutex)
+ATTRIBUTE_COLD bool fil_space_t::prepare(bool have_mutex, bool validate_page0)
 {
   ut_ad(referenced());
   if (!have_mutex)
@@ -647,7 +649,8 @@ ATTRIBUTE_COLD bool fil_space_t::prepare(bool have_mutex)
   ut_ad(!id || purpose == FIL_TYPE_TEMPORARY ||
         node == UT_LIST_GET_FIRST(chain));
 
-  const bool is_open= node && (node->is_open() || fil_node_open_file(node));
+  const bool is_open= node && (node->is_open()
+                               || fil_node_open_file(node, validate_page0));
 
   if (!is_open)
     release();
@@ -1437,7 +1440,7 @@ fil_write_flushed_lsn(
 @param id      tablespace identifier
 @return tablespace
 @retval nullptr if the tablespace is missing or inaccessible */
-fil_space_t *fil_space_t::get(ulint id)
+fil_space_t *fil_space_t::get(ulint id, bool validate_page0)
 {
   mysql_mutex_lock(&fil_system.mutex);
   fil_space_t *space= fil_space_get_by_id(id);
@@ -1447,8 +1450,9 @@ fil_space_t *fil_space_t::get(ulint id)
   if (n & STOPPING)
     space= nullptr;
 
-  if ((n & CLOSING) && !space->prepare())
+  if ((n & CLOSING) && !space->prepare(false, validate_page0)) {
     space= nullptr;
+  }
 
   return space;
 }
@@ -2302,45 +2306,8 @@ err_exit:
 		crypt_data->fill_page0(flags, page);
 	}
 
-	if (ulint zip_size = fil_space_t::zip_size(flags)) {
-		page_zip_des_t	page_zip;
-		page_zip_set_size(&page_zip, zip_size);
-		page_zip.data = page + srv_page_size;
-#ifdef UNIV_DEBUG
-		page_zip.m_start = 0;
-#endif /* UNIV_DEBUG */
-		page_zip.m_end = 0;
-		page_zip.m_nonempty = 0;
-		page_zip.n_blobs = 0;
-
-		buf_flush_init_for_writing(NULL, page, &page_zip, false);
-
-		*err = os_file_write(IORequestWrite, path, file,
-				     page_zip.data, 0, zip_size);
-	} else {
-		buf_flush_init_for_writing(NULL, page, NULL,
-					   fil_space_t::full_crc32(flags));
-
-		*err = os_file_write(IORequestWrite, path, file,
-				     page, 0, srv_page_size);
-	}
-
 	aligned_free(page);
 	fil_space_t::name_type space_name;
-
-	if (*err != DB_SUCCESS) {
-		ib::error()
-			<< "Could not write the first page to"
-			<< " tablespace '" << path << "'";
-		goto err_exit;
-	}
-
-	if (!os_file_flush(file)) {
-		ib::error() << "File flush of tablespace '"
-			<< path << "' failed";
-		*err = DB_ERROR;
-		goto err_exit;
-	}
 
 	if (has_data_dir) {
 		/* Make the ISL file if the IBD file is not
@@ -2829,7 +2796,7 @@ fil_ibd_load(
 
 	/* Read and validate the first page of the tablespace.
 	Assign a tablespace name based on the tablespace type. */
-	switch (file.validate_for_recovery()) {
+	switch (dberr_t err= file.validate_for_recovery()) {
 		os_offset_t	minimum_size;
 	case DB_SUCCESS:
 		if (file.space_id() != space_id) {
@@ -2842,6 +2809,8 @@ fil_ibd_load(
 				<< space_id << ".";
 			return(FIL_LOAD_ID_CHANGED);
 		}
+		/* fall through */
+	case DB_DEFER_TABLESPACE:
 		/* Get and test the file size. */
 		size = os_file_get_size(file.handle());
 
@@ -2862,16 +2831,16 @@ fil_ibd_load(
 				<< file.filepath() << "' is only " << size
 				<< ", should be at least " << minimum_size
 				<< "!";
+		} else if (err == DB_DEFER_TABLESPACE) {
+			return FIL_LOAD_DEFER;
 		} else {
 			/* Everything is fine so far. */
 			break;
 		}
 
 		/* fall through */
-
 	case DB_TABLESPACE_EXISTS:
 		return(FIL_LOAD_INVALID);
-
 	default:
 		return(FIL_LOAD_NOT_FOUND);
 	}

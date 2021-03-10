@@ -11,3 +11,4 @@
 ##############################################################################
 
 create-index-debug : MDEV-13680 InnoDB may crash when btr_page_alloc() fails
+log_file_name : MDEV-24626 Remove synchronous write of page0 and flushing file during file creation

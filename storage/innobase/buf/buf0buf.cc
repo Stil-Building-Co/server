@@ -3271,11 +3271,12 @@ buf_block_t*
 buf_page_create(fil_space_t *space, uint32_t offset,
                 ulint zip_size, mtr_t *mtr, buf_block_t *free_block)
 {
-  page_id_t page_id(space->id, offset);
+  page_id_t page_id (space ? space->id : offset, space ? offset : 0);
   ut_ad(mtr->is_active());
   ut_ad(page_id.space() != 0 || !zip_size);
 
-  space->free_page(offset, false);
+  if (space)
+    space->free_page(offset, false);
   free_block->initialise(page_id, zip_size, 1);
 
   const ulint fold= page_id.fold();
