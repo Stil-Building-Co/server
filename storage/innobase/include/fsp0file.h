@@ -324,6 +324,9 @@ public:
 	@return the first data page */
 	const byte* get_first_page() const { return(m_first_page); }
 
+	void set_flags(ulint flags) { m_flags = flags; }
+
+	void set_space_id(ulint space_id) { m_space_id = space_id; }
 private:
 	/** Free the filepath buffer. */
 	void free_filepath();

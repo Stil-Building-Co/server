@@ -254,7 +254,8 @@ xb_fil_cur_open(
 
 static bool page_is_corrupted(const byte *page, ulint page_no,
 			      const xb_fil_cur_t *cursor,
-			      const fil_space_t *space)
+			      const fil_space_t *space,
+			      bool &zero_filled_page0)
 {
 	byte tmp_frame[UNIV_PAGE_SIZE_MAX];
 	byte tmp_page[UNIV_PAGE_SIZE_MAX];
@@ -290,6 +291,10 @@ static bool page_is_corrupted(const byte *page, ulint page_no,
 				return true;
 			}
 		} while (p != end);
+
+		if (page_no == 0) {
+			zero_filled_page0 = true;
+		}
 
 		/* Whole zero page is valid. */
 		return false;
@@ -374,6 +379,7 @@ xb_fil_cur_result_t xb_fil_cur_read(xb_fil_cur_t*	cursor,
 	ib_int64_t		offset;
 	ib_int64_t		to_read;
 	const ulint		page_size = cursor->page_size;
+	bool			zero_filled_page0= false;
 	xb_ad(!cursor->is_system() || page_size == srv_page_size);
 
 	cursor->read_filter->get_next_batch(&cursor->read_filter_ctxt,
@@ -428,13 +434,15 @@ read_retry:
 		ret = XB_FIL_CUR_ERROR;
 		goto func_exit;
 	}
+
 	/* check pages for corruption and re-read if necessary. i.e. in case of
 	partially written pages */
 	for (page = cursor->buf, i = 0; i < npages;
 	     page += page_size, i++) {
 		unsigned page_no = cursor->buf_page_no + i;
 
-		if (page_is_corrupted(page, page_no, cursor, space)){
+		if (!zero_filled_page0
+		    && page_is_corrupted(page, page_no, cursor, space, zero_filled_page0)){
 			retry_count--;
 
 			if (retry_count == 0) {

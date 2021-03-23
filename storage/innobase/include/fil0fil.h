@@ -986,7 +986,7 @@ public:
 
   /** Read the first page of a data file.
   @return whether the page was found valid */
-  bool read_page0();
+  bool read_page0(bool validate_page0=true);
 
   /** Determine the next tablespace for encryption key rotation.
   @param space    current tablespace (nullptr to start from the beginning)

@@ -510,7 +510,8 @@ bool CorruptedPages::empty() const
 }
 
 static void xb_load_single_table_tablespace(const std::string &space_name,
-                                            bool set_size);
+                                            bool set_size,
+                                            ulint defer_space_id=0);
 static void xb_data_files_close();
 static fil_space_t* fil_space_get_by_name(const char* name);
 
@@ -587,7 +588,8 @@ xtrabackup_add_datasink(ds_ctxt_t *ds)
 typedef void (*process_single_tablespace_func_t)(const char *dirname,
                                                  const char *filname,
                                                  bool is_remote,
-                                                 bool skip_node_page0);
+                                                 bool skip_node_page0,
+                                                 ulint defer_space_id);
 static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback);
 
 /* ======== Datafiles iterator ======== */
@@ -1680,7 +1682,8 @@ debug_sync_point(const char *name)
 static std::set<std::string> tables_for_export;
 
 static void append_export_table(const char *dbname, const char *tablename,
-                                bool is_remote, bool skip_node_page0)
+                                bool is_remote, bool skip_node_page0,
+                                ulint defer_space_id)
 {
   if(dbname && tablename && !is_remote)
   {
@@ -2719,7 +2722,6 @@ xb_get_copy_action(const char *dflt)
 	return(action);
 }
 
-
 /** Copy innodb data file to the specified destination.
 
 @param[in] node	file node of a tablespace
@@ -3275,11 +3277,14 @@ xb_fil_io_init()
 node page0 will be read, and it's size and free pages limit
 will be set from page 0, what is neccessary for checking and fixing corrupted
 pages.
+@param[in] defer_space_id use the space id to create space object
+when there is deferred tablespace
 */
 static void xb_load_single_table_tablespace(const char *dirname,
                                             const char *filname,
                                             bool is_remote,
-                                            bool skip_node_page0)
+                                            bool skip_node_page0,
+                                            ulint defer_space_id)
 {
 	ut_ad(srv_operation == SRV_OPERATION_BACKUP
 	      || srv_operation == SRV_OPERATION_RESTORE_DELTA
@@ -3302,6 +3307,7 @@ static void xb_load_single_table_tablespace(const char *dirname,
 	lsn_t	flush_lsn;
 	dberr_t	err;
 	fil_space_t	*space;
+	bool	defer = false;
 
 	name = static_cast<char*>(ut_malloc_nokey(pathlen));
 
@@ -3334,6 +3340,22 @@ static void xb_load_single_table_tablespace(const char *dirname,
 
 	for (int i = 0; i < 10; i++) {
 		err = file->validate_first_page(&flush_lsn);
+
+		if (err == DB_DEFER_TABLESPACE) {
+
+			if (defer_space_id) {
+				defer = true;
+				file->set_space_id(defer_space_id);
+				file->set_flags(FSP_FLAGS_PAGE_SSIZE());
+				err = DB_SUCCESS;
+				break;
+			}
+
+			delete file;
+			ut_free(name);
+			return;
+		}
+
 		if (err != DB_CORRUPTION) {
 			break;
 		}
@@ -3353,7 +3375,7 @@ static void xb_load_single_table_tablespace(const char *dirname,
 			   skip_node_page0 ? file->detach() : pfs_os_file_t(),
 			   0, false, false);
 		mysql_mutex_lock(&fil_system.mutex);
-		space->read_page0();
+		space->read_page0(!defer);
 		mysql_mutex_unlock(&fil_system.mutex);
 
 		if (srv_operation == SRV_OPERATION_RESTORE_DELTA
@@ -3372,7 +3394,8 @@ static void xb_load_single_table_tablespace(const char *dirname,
 }
 
 static void xb_load_single_table_tablespace(const std::string &space_name,
-                                            bool skip_node_page0)
+                                            bool skip_node_page0,
+                                            ulint defer_space_id)
 {
   std::string name(space_name);
   bool is_remote= access((name + ".ibd").c_str(), R_OK) != 0;
@@ -3390,7 +3413,7 @@ static void xb_load_single_table_tablespace(const std::string &space_name,
   *p= 0;
   const char *tablename= p + 1;
   xb_load_single_table_tablespace(dbname, tablename, is_remote,
-                                  skip_node_page0);
+                                  skip_node_page0, defer_space_id);
 }
 
 /** Scan the database directories under the MySQL datadir, looking for
@@ -3434,7 +3457,7 @@ static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback)
 			bool is_ibd = !is_isl && ends_with(dbinfo.name,".ibd");
 
 			if (is_isl || is_ibd) {
-				(*callback)(NULL, dbinfo.name, is_isl, false);
+				(*callback)(NULL, dbinfo.name, is_isl, false, 0);
 			}
 		}
 
@@ -3490,7 +3513,7 @@ static dberr_t enumerate_ibd_files(process_single_tablespace_func_t callback)
 				if (strlen(fileinfo.name) > 4) {
 					bool is_isl= false;
 					if (ends_with(fileinfo.name, ".ibd") || ((is_isl = ends_with(fileinfo.name, ".isl"))))
-						(*callback)(dbinfo.name, fileinfo.name, is_isl, false);
+						(*callback)(dbinfo.name, fileinfo.name, is_isl, false, 0);
 				}
 			}
 
@@ -4550,7 +4573,6 @@ fail_before_log_copying_thread_start:
 	return(true);
 }
 
-
 /**
 This function handles DDL changes at the end of backup, under protection of
 FTWRL.  This ensures consistent backup in presence of DDL.
@@ -4571,9 +4593,9 @@ FTWRL.  This ensures consistent backup in presence of DDL.
 */
 void backup_fix_ddl(CorruptedPages &corrupted_pages)
 {
-	std::set<std::string> new_tables;
 	std::set<std::string> dropped_tables;
 	std::map<std::string, std::string> renamed_tables;
+	space_id_to_name_t new_tables;
 
 	/* Disable further DDL on backed up tables (only needed for --no-lock).*/
 	pthread_mutex_lock(&backup_mutex);
@@ -4623,7 +4645,7 @@ void backup_fix_ddl(CorruptedPages &corrupted_pages)
 
 		if (ddl_tracker.drops.find(id) == ddl_tracker.drops.end()) {
 			dropped_tables.erase(name);
-			new_tables.insert(name);
+			new_tables[id] = name;
 			if (opt_log_innodb_page_corruption)
 				corrupted_pages.drop_space(id);
 		}
@@ -4665,12 +4687,15 @@ void backup_fix_ddl(CorruptedPages &corrupted_pages)
 	}
 
 	DBUG_EXECUTE_IF("check_mdl_lock_works", DBUG_ASSERT(new_tables.size() == 0););
-	for (std::set<std::string>::iterator iter = new_tables.begin();
-		iter != new_tables.end(); iter++) {
-		const char *space_name = iter->c_str();
+
+	for(space_id_to_name_t::iterator iter = new_tables.begin();
+	    iter != new_tables.end(); iter++) {
+		const char *space_name = iter->second.c_str();
 		if (check_if_skip_table(space_name))
 			continue;
-		xb_load_single_table_tablespace(*iter, false);
+
+		xb_load_single_table_tablespace(
+			iter->second, false, iter->first);
 	}
 
 	datafiles_iter_t it2;
@@ -4681,6 +4706,7 @@ void backup_fix_ddl(CorruptedPages &corrupted_pages)
 		std::string dest_name= filename_to_spacename(
 			node->name, strlen(node->name));
 		dest_name.append(".new");
+
 		xtrabackup_copy_datafile(node, 0, dest_name.c_str(), wf_write_through,
 			corrupted_pages);
 	}

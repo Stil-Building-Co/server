@@ -1065,8 +1065,9 @@ fil_assign_new_space_id(
 }
 
 /** Read the first page of a data file.
+@param validate_page0	whether to read and validate page0
 @return whether the page was found valid */
-bool fil_space_t::read_page0()
+bool fil_space_t::read_page0(bool validate_page0)
 {
   ut_ad(fil_system.is_initialised());
   mysql_mutex_assert_owner(&fil_system.mutex);
@@ -1083,7 +1084,7 @@ bool fil_space_t::read_page0()
     ut_ad("this should not happen" == 0);
     return false;
   }
-  const bool ok= node->is_open() || fil_node_open_file(node);
+  const bool ok= node->is_open() || fil_node_open_file(node, validate_page0);
   release();
   return ok;
 }

@@ -842,6 +842,7 @@ fil_name_process(char* name, ulint len, ulint space_id, bool deleted)
 		case FIL_LOAD_OK:
 			ut_ad(space != NULL);
 
+			defer_spaces.erase((uint32_t)space_id);
 			if (!f.space) {
 				if (f.size
 				    || f.flags != f.initial_flags) {
@@ -889,8 +890,9 @@ same_space:
 			}
 			break;
 		case FIL_LOAD_DEFER:
-			if (!p.second) f.name= fname.name;
-			defer_spaces.emplace(space_id);
+			//if (!p.second) f.name= fname.name;
+			if (f.status != file_name_t::DELETED)
+			  defer_spaces.emplace(space_id);
 			break;
 		case FIL_LOAD_INVALID:
 			ut_ad(space == NULL);
@@ -2635,6 +2637,8 @@ inline buf_block_t *recv_sys_t::recover_low(const page_id_t page_id,
   }
   else
   {
+    if (first_page && !space)
+      block->fix();
     ut_ad(&recs == &pages.find(page_id)->second);
     i.created= true;
     recv_recover_page(block, mtr, p, space, &i);
@@ -2745,10 +2749,16 @@ static dberr_t recv_create_deferred_space(buf_block_t *first_block)
 {
   auto it= recv_spaces.find(first_block->page.id().space());
   ut_ad(it != recv_spaces.end());
+
   byte *page= UNIV_LIKELY_NULL(first_block->page.zip.data)
 	  ? first_block->page.zip.data
 	  : first_block->frame;
-  char *space_name= fil_path_to_space_name(it->second.name.c_str());
+  const char *file_name= it->second.name.c_str(); 
+  auto renamed_space= renamed_spaces.find(first_block->page.id().space());
+  if (renamed_space != renamed_spaces.end())
+    file_name= renamed_space->second.c_str();
+  /*
+  char *space_name= fil_path_to_space_name(file_name); */
   const uint32_t size = fsp_header_get_field(page, FSP_SIZE);
   const uint32_t free_limit = fsp_header_get_field(
 	page, FSP_FREE_LIMIT);
@@ -2758,11 +2768,12 @@ static dberr_t recv_create_deferred_space(buf_block_t *first_block)
   fil_space_crypt_t *crypt_data= fil_space_read_crypt_data(
      fil_space_t::zip_size(it->second.flags), page);
   fil_space_t *space= fil_space_t::create(
-    space_name, it->first, it->second.flags, FIL_TYPE_TABLESPACE,
+    it->first, it->second.flags, FIL_TYPE_TABLESPACE,
     crypt_data);
+
   if (!space)
     return DB_TABLESPACE_NOT_FOUND;
-  space->add(it->second.name.c_str(), OS_FILE_CLOSED, 0, false, false);
+  space->add(file_name, OS_FILE_CLOSED, 0, false, false);
 
   space->recv_size= it->second.size;
   space->size_in_header = size;
@@ -2785,6 +2796,7 @@ static dberr_t recv_init_deferred_space(uint32_t space)
     {
       err= recv_create_deferred_space(first_block);
       defer_spaces.erase(space);
+      first_block->unfix();
     }
     return err;
   }

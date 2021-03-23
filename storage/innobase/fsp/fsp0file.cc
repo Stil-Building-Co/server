@@ -487,7 +487,8 @@ err_exit:
 		}
 
 		if (nonzero_bytes == 0) {
-			if (recv_recovery_is_on()) {
+			if (recv_recovery_is_on()
+			    || srv_operation == SRV_OPERATION_BACKUP) {
 				free_first_page();
 				return DB_DEFER_TABLESPACE;
 			}
