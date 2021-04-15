@@ -43,6 +43,7 @@
 #include "sp.h"
 #include "sp_cache.h"
 #include "sql_trigger.h"
+#include "table.h"
 #include "transaction.h"
 #include "sql_prepare.h"
 #include "sql_statistics.h"
@@ -1984,6 +1985,16 @@ retry_share:
     DBUG_RETURN(FALSE);
   }
 
+  mysql_mutex_lock(&share->LOCK_share);
+  if (share->vers_concurrent_create &&
+      share->vers_concurrent_create->is_empty())
+  {
+    delete share->vers_concurrent_create;
+    share->vers_concurrent_create= NULL;
+  }
+  mysql_mutex_unlock(&share->LOCK_share);
+
+
 #ifdef WITH_WSREP
   if (!((flags & MYSQL_OPEN_IGNORE_FLUSH) ||
         (thd->wsrep_applier)))
@@ -2111,29 +2122,33 @@ retry_share:
        NOTE: The semantics of vers_set_hist_part() is double: even when we
        don't need auto-create, we need to update part_info->hist_part.
     */
-    mysql_mutex_lock(&table->s->LOCK_share);
-    uint *create_count= (table_list->vers_skip_auto_create ||
-                         table->s->vers_skip_auto_create) ?
-                           NULL : &ot_ctx->vers_create_count;
+    uint *create_count= table_list->vers_skip_auto_create ?
+                          NULL : &ot_ctx->vers_create_count;
     table_list->vers_skip_auto_create= true;
     if (table->part_info->vers_set_hist_part(thd, create_count))
     {
-      mysql_mutex_unlock(&table->s->LOCK_share);
       MYSQL_UNBIND_TABLE(table->file);
       tc_release_table(table);
       DBUG_RETURN(TRUE);
     }
     if (ot_ctx->vers_create_count)
     {
-      table->s->vers_skip_auto_create= true;
+      mysql_mutex_lock(&table->s->LOCK_share);
+      if (!table->s->vers_concurrent_create)
+        table->s->vers_concurrent_create= new TABLE_SHARE::vers_concurrent_create_t(thd);
+      table->s->vers_concurrent_create->increment();
       mysql_mutex_unlock(&table->s->LOCK_share);
+      /*
+         NOTE: we are holding MDL_SHARED_WRITE, none of threads hold table share not
+         holding MDL_SHARED_WRITE. Until we released the table by tc_release_table()
+         parallel recover_from_failed_open() will not continue past tdc_remove_table().
+      */
       MYSQL_UNBIND_TABLE(table->file);
       tc_release_table(table);
       ot_ctx->request_backoff_action(Open_table_context::OT_ADD_HISTORY_PARTITION,
                                       table_list);
       DBUG_RETURN(TRUE);
     }
-    mysql_mutex_unlock(&table->s->LOCK_share);
   }
 
   if (!(flags & MYSQL_OPEN_HAS_MDL_LOCK) &&
@@ -3212,6 +3227,7 @@ request_backoff_action(enum_open_table_action action_arg,
   {
     DBUG_ASSERT(action_arg == OT_DISCOVER || action_arg == OT_REPAIR ||
                 action_arg == OT_ADD_HISTORY_PARTITION);
+    m_orig_table= table;
     m_failed_table= (TABLE_LIST*) m_thd->alloc(sizeof(TABLE_LIST));
     if (m_failed_table == NULL)
       return TRUE;
@@ -3266,6 +3282,7 @@ Open_table_context::recover_from_failed_open()
 {
   bool result= FALSE;
   MDL_deadlock_discovery_repair_handler handler;
+  TABLE_SHARE::vers_concurrent_create_t *vers_concurrent_create;
   /*
     Install error handler to mark transaction to rollback on DEADLOCK error.
   */
@@ -3274,25 +3291,72 @@ Open_table_context::recover_from_failed_open()
   /* Execute the action. */
   switch (m_action)
   {
-    case OT_BACKOFF_AND_RETRY:
-    case OT_REOPEN_TABLES:
-      break;
-    case OT_DISCOVER:
-    case OT_REPAIR:
     case OT_ADD_HISTORY_PARTITION:
+    {
       result= lock_table_names(m_thd, m_thd->lex->create_info, m_failed_table,
                                NULL, get_timeout(), 0);
+      TABLE_SHARE *s= tdc_acquire_share(m_thd, m_failed_table, GTS_TABLE);
+      vers_concurrent_create= s->vers_concurrent_create;
+      tdc_release_share(s);
       if (result)
       {
-        if (m_action == OT_ADD_HISTORY_PARTITION &&
-            m_thd->get_stmt_da()->sql_errno() == ER_LOCK_WAIT_TIMEOUT)
+        if (m_thd->get_stmt_da()->sql_errno() == ER_LOCK_WAIT_TIMEOUT)
         {
           // MDEV-23642 Locking timeout caused by auto-creation affects original DML
           m_thd->clear_error();
           result= false;
         }
+        (void) vers_concurrent_create->decrement(NULL);
         break;
       }
+
+      tdc_remove_table(m_thd, m_failed_table->db.str,
+                       m_failed_table->table_name.str);
+
+      if (vers_concurrent_create->decrement(m_thd))
+      {
+        /*
+           NOTE: Reopen will not continue past MDL_SHARED_WRITE acquisition
+           until partition-creator thread exits MDL_EXCLUSIVE mode.
+
+           None of threads are going to vers_concurrent_create->increment()
+           because we are past tdc_remove_table().
+        */
+        vers_create_count= 0;
+        m_orig_table->vers_skip_auto_create= false;
+        break;
+      }
+
+      TABLE *table= open_ltable(m_thd, m_failed_table, TL_WRITE,
+                MYSQL_OPEN_HAS_MDL_LOCK | MYSQL_OPEN_IGNORE_LOGGING_FORMAT);
+      if (table == NULL)
+      {
+        m_thd->clear_error();
+        break;
+      }
+
+      DBUG_ASSERT(vers_create_count);
+      TABLE_LIST *tl= m_failed_table;
+      /* NOTE: this removes table share from hash. */
+      result= vers_add_hist_parts(m_thd, tl, vers_create_count);
+      s= tdc_acquire_share(m_thd, m_failed_table, GTS_TABLE);
+      s->vers_concurrent_create= vers_concurrent_create;
+      tdc_release_share(s);
+      if (!m_thd->transaction->stmt.is_empty())
+        trans_commit_stmt(m_thd);
+      close_tables_for_reopen(m_thd, &tl, start_of_statement_svp());
+      vers_create_count= 0;
+      break;
+    }
+    case OT_BACKOFF_AND_RETRY:
+    case OT_REOPEN_TABLES:
+      break;
+    case OT_DISCOVER:
+    case OT_REPAIR:
+      result= lock_table_names(m_thd, m_thd->lex->create_info, m_failed_table,
+                               NULL, get_timeout(), 0);
+      if (result)
+        break;
 
       tdc_remove_table(m_thd, m_failed_table->db.str,
                        m_failed_table->table_name.str);
@@ -3324,54 +3388,21 @@ Open_table_context::recover_from_failed_open()
           result= auto_repair_table(m_thd, m_failed_table);
           break;
         case OT_ADD_HISTORY_PARTITION:
-        {
-          result= false;
-          TABLE *table= open_ltable(m_thd, m_failed_table, TL_WRITE,
-                    MYSQL_OPEN_HAS_MDL_LOCK | MYSQL_OPEN_IGNORE_LOGGING_FORMAT);
-          if (table == NULL)
-          {
-            m_thd->clear_error();
-            break;
-          }
-
-          mysql_mutex_lock(&table->s->LOCK_share);
-          if (table->s->vers_skip_auto_create)
-          {
-            mysql_mutex_unlock(&table->s->LOCK_share);
-            break;
-          }
-          table->s->vers_skip_auto_create= true;
-          mysql_mutex_unlock(&table->s->LOCK_share);
-
-          DBUG_ASSERT(vers_create_count);
-          TABLE_LIST *tl= m_failed_table;
-          result= vers_add_hist_parts(m_thd, tl, vers_create_count);
-#ifndef DBUG_OFF
-          TABLE_SHARE *share= tdc_acquire_share(m_thd, tl, GTS_TABLE, NULL);
-          DBUG_ASSERT(!share->vers_skip_auto_create);
-          tdc_release_share(share);
-#endif
-          if (!m_thd->transaction->stmt.is_empty())
-            trans_commit_stmt(m_thd);
-          close_tables_for_reopen(m_thd, &tl, start_of_statement_svp());
-          vers_create_count= 0;
-          break;
-        }
         case OT_BACKOFF_AND_RETRY:
         case OT_REOPEN_TABLES:
         case OT_NO_ACTION:
           DBUG_ASSERT(0);
       }
-      /*
-        Rollback to start of the current statement to release exclusive lock
-        on table which was discovered but preserve locks from previous statements
-        in current transaction.
-      */
-      m_thd->mdl_context.rollback_to_savepoint(start_of_statement_svp());
       break;
     case OT_NO_ACTION:
       DBUG_ASSERT(0);
   }
+  /*
+    Rollback to start of the current statement to release exclusive lock
+    on table which was discovered but preserve locks from previous statements
+    in current transaction.
+  */
+  m_thd->mdl_context.rollback_to_savepoint(start_of_statement_svp());
   m_thd->pop_internal_handler();
   /*
     Reset the pointers to conflicting MDL request and the

@@ -583,6 +583,7 @@ private:
     should be repaired.
   */
   TABLE_LIST *m_failed_table;
+  TABLE_LIST *m_orig_table;
   MDL_savepoint m_start_of_statement_svp;
   /**
     Lock timeout in seconds. Initialized to LONG_TIMEOUT when opening system

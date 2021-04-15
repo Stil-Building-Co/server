@@ -36,6 +36,8 @@
 #include "sql_type.h"               /* vers_kind_t */
 #include "privilege.h"              /* privilege_t */
 
+#include <atomic>
+
 /* Structs that defines the TABLE */
 
 class Item;				/* Needed by ORDER */
@@ -910,10 +912,30 @@ struct TABLE_SHARE
   period_info_t vers;
   period_info_t period;
   /*
-      Protect multiple threads from repeating partition auto-create over
-      single share.
+      Protect multiple threads from concurrent partition auto-create.
   */
-  bool          vers_skip_auto_create;
+  class vers_concurrent_create_t
+  {
+    std::atomic_size_t thread_count;
+    THD *master_thd;
+  public:
+    vers_concurrent_create_t(THD *thd) : thread_count(0), master_thd(thd) {}
+    void increment()
+    {
+      thread_count++;
+    }
+    bool decrement(THD *thd)
+    {
+      thread_count--;
+      return thd != master_thd;
+    }
+    bool is_empty()
+    {
+      return thread_count == 0;
+    }
+    vers_concurrent_create_t() : thread_count(0), master_thd(NULL) {}
+  };
+  vers_concurrent_create_t *vers_concurrent_create;
 
   bool init_period_from_extra2(period_info_t *period, const uchar *data,
                                const uchar *end);
